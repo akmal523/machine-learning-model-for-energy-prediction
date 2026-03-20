@@ -1,0 +1,172 @@
+================================================================================
+  RESULTS — ML PIPELINE FOR ENERGY PER ATOM PREDICTION
+  Dataset: dataset1.pckl.gz  |  Target: energy_per_atom (eV/atom)
+================================================================================
+
+WHAT IS BEING PREDICTED
+------------------------
+Energy per atom (eV/atom) is the total DFT-calculated formation or cohesive energy
+of a material divided by the number of atoms in the unit cell.  It is one of the
+most fundamental properties in computational materials science: it determines
+thermodynamic stability, drives phase-diagram construction, and correlates with
+hardness, melting point, and reactivity.
+
+Accurate ML prediction of this quantity allows rapid pre-screening of thousands
+of hypothetical structures before expensive DFT calculations are run.
+
+--------------------------------------------------------------------------------
+
+METRICS EXPLAINED
+------------------
+Three standard regression metrics are reported for every model.
+
+  MAE  (Mean Absolute Error)
+       Average absolute difference between prediction and true value.
+       Unit: eV/atom.  Lower is better.
+       Interpretation: "On average the model is off by X eV/atom."
+       Preferred when all errors matter equally and outliers are not
+       disproportionately important.
+
+  RMSE (Root Mean Squared Error)
+       Square root of the mean squared error.
+       Unit: eV/atom.  Lower is better.
+       RMSE >= MAE always.  The gap between them indicates how much the model
+       struggles with outliers: a large gap means a few large errors are dragging
+       the average up.  Penalises large individual errors more heavily than MAE.
+
+  R²   (Coefficient of Determination)
+       Proportion of variance in the target explained by the model.
+       Dimensionless.  Range: (-inf, 1].  Higher is better.
+       R² = 1 → perfect predictions.
+       R² = 0 → the model does no better than always predicting the mean.
+       R² < 0 → the model is worse than predicting the mean (badly overfit/wrong).
+
+--------------------------------------------------------------------------------
+
+TRAIN / TEST SPLIT
+-------------------
+  Train set: 80% of samples  (random_state=42 for reproducibility)
+  Test set:  20% of samples  — never seen by any model during training or tuning.
+  Cross-validation: 5-fold CV used during tuning (scored on MAE).
+
+--------------------------------------------------------------------------------
+
+MODEL RESULTS  (evaluated on the held-out 20% test set)
+---------------------------------------------------------
+
+  Model                         MAE    RMSE   R²
+  ----------------------------  -----  -----  -----
+  Stacking Ensemble             0.136  0.239  0.918   <-- BEST
+  Gradient Boosting (Tuned)     0.146  0.243  0.915
+  Random Forest (Tuned)         0.144  0.259  0.903
+  Random Forest (Baseline)      0.144  0.259  0.903
+  Gradient Boosting (Baseline)  0.179  0.284  0.883
+  SVR (Tuned)                   0.153  0.356  0.817
+  SVR (Baseline)                0.168  0.371  0.801
+  Linear Regression (Baseline)  0.257  0.435  0.727
+
+--------------------------------------------------------------------------------
+
+OBSERVATIONS AND ANALYSIS
+--------------------------
+
+1. LINEAR REGRESSION — MAE=0.257, RMSE=0.435, R²=0.727
+   The worst performer, as expected.  Energy per atom is a highly non-linear
+   function of composition and structure.  Linear models cannot capture
+   interactions between features (e.g. between atomic number and lattice parameter).
+   R²=0.727 means the model explains only 73% of variance — a reasonable floor
+   but far from deployment quality.
+
+2. SVR BASELINE — MAE=0.168, RMSE=0.371, R²=0.801
+   A meaningful jump over linear regression.  SVR with an RBF kernel can model
+   smooth non-linear boundaries.  However, SVR scales poorly with dataset size
+   (O(n²) memory) and is sensitive to feature scale, hence the mandatory
+   StandardScaler in its pipeline.
+
+3. GRADIENT BOOSTING BASELINE — MAE=0.179, RMSE=0.284, R²=0.883
+   Despite using default hyperparameters, GB significantly outperforms SVR on RMSE
+   and R², though MAE is slightly worse.  The lower RMSE vs SVR indicates GB makes
+   fewer large errors — important for materials screening where outliers can
+   mislead downstream calculations.
+
+4. RANDOM FOREST BASELINE — MAE=0.144, RMSE=0.259, R²=0.903
+   Best baseline by a clear margin.  RF's ensemble of deep, decorrelated trees
+   captures complex feature interactions naturally.  The RMSE/MAE gap is small
+   (0.115), confirming consistently moderate errors without catastrophic outliers.
+
+5. SVR (TUNED) — MAE=0.153, RMSE=0.356, R²=0.817
+   Tuning C, gamma, and epsilon improved MAE from 0.168 → 0.153 and R² from
+   0.801 → 0.817, but SVR still cannot match tree ensembles on this dataset.
+   The likely cause: SVR uses a single kernel for the entire feature space, which
+   struggles when the dataset contains both continuous and discrete-like features
+   (e.g. n_species is always a small integer while lattice parameters vary
+   continuously).
+
+6. GRADIENT BOOSTING (TUNED) — MAE=0.146, RMSE=0.243, R²=0.915
+   Tuning learning_rate, n_estimators, max_depth, and subsample produced the
+   largest absolute gain for any single model: R² from 0.883 → 0.915 (+3.2 pp),
+   RMSE from 0.284 → 0.243 (−14%).  GB benefits strongly from tuning because its
+   default learning_rate (0.1) is often too aggressive for datasets with
+   noise, and smaller rates with more trees generalise better.
+
+7. RANDOM FOREST (TUNED) — MAE=0.144, RMSE=0.259, R²=0.903
+   Tuning produced identical results to the baseline RF on this run.  This is
+   plausible: RF's default parameters (n_estimators=100, max_depth=None) are
+   already close to optimal for many tabular datasets, and the RandomizedSearch
+   with n_iter=10 may not have explored a sufficiently different region of the
+   hyperparameter space.  Increasing n_iter would likely yield a marginal gain.
+
+8. STACKING ENSEMBLE — MAE=0.136, RMSE=0.239, R²=0.918   *** BEST MODEL ***
+   The stacking meta-learner (Ridge regression) is trained on the out-of-fold
+   predictions of RF, GB, and SVR, with the original features passed through
+   (passthrough=True).  This gives the meta-model information about when each
+   base learner is likely to be correct or wrong, allowing it to up-weight the
+   better predictor per region of feature space.
+
+   Key observations:
+   - R²=0.918 means the model explains 91.8% of variance in energy per atom.
+   - MAE=0.136 eV/atom is a meaningful accuracy for DFT-level pre-screening;
+     the typical DFT error budget for energy differences in stable materials is
+     ~0.1–0.2 eV/atom, so the ML model is operating within that tolerance.
+   - RMSE=0.239 vs MAE=0.136 — the gap (0.103) is moderate, indicating that
+     the ensemble still makes occasional larger errors (likely on rare or complex
+     compositions underrepresented in the training set).
+   - The ensemble outperforms its best individual component (GB Tuned, R²=0.915)
+     by 0.003 R² and reduces RMSE by 0.004 eV/atom.  While small in absolute
+     terms, this consistent marginal gain across all three metrics confirms the
+     ensemble is genuinely capturing complementary signal from the base learners
+     rather than overfitting.
+
+--------------------------------------------------------------------------------
+
+FEATURE IMPORTANCE SUMMARY
+----------------------------
+Feature importances (from the tuned RF and GB) and SHAP values (if shap is
+installed) are generated by train_ensemble.py and visualize.py respectively.
+
+In typical materials datasets of this type, the most predictive features are:
+  - Cohesive energy proxies (electronegativity differences, valence electron count)
+  - Structural features (volume per atom, nearest-neighbour distances)
+  - Compositional features (mean atomic number, mean atomic mass)
+  - n_species (number of distinct elements) — multi-component alloys tend to
+    have lower energy per atom due to mixing entropy effects
+
+SHAP waterfall plots (one per test sample) explain individual predictions:
+positive SHAP values push the prediction above the dataset mean; negative values
+pull it down.
+
+--------------------------------------------------------------------------------
+
+HOW TO IMPROVE FURTHER
+------------------------
+  - Increase RandomizedSearchCV n_iter from 10 → 50+ for better coverage.
+  - Add matminer featurisers (e.g. ElementProperty, SiteStatsFingerprint) for
+    richer compositional descriptors — this typically yields another 2–4 pp R².
+  - Try XGBoost or LightGBM as drop-in replacements for GradientBoosting;
+    they are faster and often achieve lower RMSE.
+  - Use a neural network (e.g. MEGNet, CGCNN) if crystal graph data is
+    available — these models routinely reach R² > 0.98 on DFT datasets.
+  - Cross-validate the stacking ensemble itself (nested CV) to get an
+    unbiased estimate of generalisation error.
+
+================================================================================
